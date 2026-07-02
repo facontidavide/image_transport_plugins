@@ -31,7 +31,11 @@
 
 #include <zstd.h>
 
-#if defined(__AVX2__)
+// Runtime AVX2 dispatch for the dictionary probe: released binaries build
+// with portable flags, so the SIMD path is selected per-CPU at load time
+// (GCC/Clang on x86-64; other targets use the scalar probe).
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define DEPTH_CODEC_AVX2_DISPATCH 1
 #include <immintrin.h>
 #endif
 
@@ -206,7 +210,7 @@ struct alignas(64) DictBucket
 };
 static_assert(sizeof(DictBucket) == 64, "bucket must be one cache line");
 
-bool build_value_dict(
+bool build_value_dict_scalar(
   const uint32_t * words, size_t n,
   std::vector<uint32_t> & entries, std::vector<uint16_t> & idx)
 {
@@ -222,23 +226,13 @@ bool build_value_dict(
     uint32_t id;
     for (;; ) {
       DictBucket & bucket = table[b];
-      uint32_t m;
-#if defined(__AVX2__)
-      const __m256i vk = _mm256_set1_epi32(static_cast<int32_t>(k32));
-      const __m256i keys =
-        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(bucket.keys));
-      m = static_cast<uint32_t>(
-        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(keys, vk))));
-      m &= (1u << bucket.cnt) - 1;
-#else
-      m = 0;
+      uint32_t m = 0;
       for (unsigned k = 0; k < bucket.cnt; ++k) {
         if (bucket.keys[k] == k32) {
           m = 1u << k;
           break;
         }
       }
-#endif
       if (m) {
         id = bucket.vals[std::countr_zero(m)];
         break;
@@ -259,6 +253,69 @@ bool build_value_dict(
     idx[i] = static_cast<uint16_t>(id);
   }
   return true;
+}
+
+#if defined(DEPTH_CODEC_AVX2_DISPATCH)
+// Verbatim copy of build_value_dict_scalar with the probe replaced by one
+// 8-wide SIMD compare. Compiled with the avx2 target attribute so portable
+// (non -mavx2) builds still contain it and can select it at runtime; a
+// shared inline body cannot carry a per-caller target attribute.
+__attribute__((target("avx2"))) bool build_value_dict_avx2(
+  const uint32_t * words, size_t n,
+  std::vector<uint32_t> & entries, std::vector<uint16_t> & idx)
+{
+  constexpr size_t nb = 1u << 14;
+  constexpr size_t max_dict = 1u << 16;
+  std::vector<DictBucket> table(nb);
+  entries.clear();
+  entries.reserve(1u << 12);
+  idx.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t k32 = words[i];
+    size_t b = (k32 * 2654435761u) >> 18;
+    uint32_t id;
+    for (;; ) {
+      DictBucket & bucket = table[b];
+      const __m256i vk = _mm256_set1_epi32(static_cast<int32_t>(k32));
+      const __m256i keys =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(bucket.keys));
+      uint32_t m = static_cast<uint32_t>(
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(keys, vk))));
+      m &= (1u << bucket.cnt) - 1;
+      if (m) {
+        id = bucket.vals[std::countr_zero(m)];
+        break;
+      }
+      if (bucket.cnt < 8) {
+        if (entries.size() >= max_dict) {
+          return false;
+        }
+        id = static_cast<uint32_t>(entries.size());
+        bucket.keys[bucket.cnt] = k32;
+        bucket.vals[bucket.cnt] = static_cast<uint16_t>(id);
+        ++bucket.cnt;
+        entries.push_back(k32);
+        break;
+      }
+      b = (b + 1) & (nb - 1);
+    }
+    idx[i] = static_cast<uint16_t>(id);
+  }
+  return true;
+}
+#endif  // DEPTH_CODEC_AVX2_DISPATCH
+
+bool build_value_dict(
+  const uint32_t * words, size_t n,
+  std::vector<uint32_t> & entries, std::vector<uint16_t> & idx)
+{
+#if defined(DEPTH_CODEC_AVX2_DISPATCH)
+  static const bool use_avx2 = __builtin_cpu_supports("avx2");
+  if (use_avx2) {
+    return build_value_dict_avx2(words, n, entries, idx);
+  }
+#endif
+  return build_value_dict_scalar(words, n, entries, idx);
 }
 
 // ---- dpred payload (32FC1) ---------------------------------------------------
