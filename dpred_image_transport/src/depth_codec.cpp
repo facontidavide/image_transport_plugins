@@ -168,9 +168,12 @@ void predict_pack(const uint16_t * vals, uint32_t w, uint32_t h, uint8_t * lo, u
   }
 }
 
-// Inverse of predict_pack. Reconstruction is inherently serial along a row
-// (each prediction needs the value just decoded), but branchless MED keeps
-// the dependency chain tight.
+// Inverse of predict_pack. Reconstruction is serial along a row (each
+// prediction needs the value just decoded), but row y+1 at column c only
+// needs row y up to column c: processing R rows along a skewed diagonal
+// ("wavefront") therefore runs R independent dependency chains that the
+// out-of-order core overlaps. Pure decoder-side optimization: the format
+// and the results are identical to the serial scan.
 void predict_unpack(const uint8_t * lo, const uint8_t * hi, uint32_t w, uint32_t h, uint16_t * vals)
 {
   const auto unstep = [&](size_t i, int32_t pred) -> uint16_t {
@@ -180,13 +183,55 @@ void predict_unpack(const uint8_t * lo, const uint8_t * hi, uint32_t w, uint32_t
       vals[i] = k;
       return k;
     };
-  if (w && h) {
-    unstep(0, 0);
+  if (w == 0 || h == 0) {
+    return;
   }
+  // First row: pure left-prediction chain.
+  unstep(0, 0);
   for (uint32_t x = 1; x < w; ++x) {
     unstep(x, vals[x - 1]);
   }
-  for (uint32_t y = 1; y < h; ++y) {
+
+  constexpr uint32_t R = 4;  // interleaved rows = parallel dependency chains
+  uint32_t y = 1;
+  if (w >= 2 * R) {
+    for (; y + R <= h; y += R) {
+      uint16_t left[R] = {};
+      // Ramp-up: row y+r starts one diagonal step after row y+r-1, which
+      // keeps the in-strip dependency satisfied (row r reads row r-1 one
+      // step behind).
+      for (uint32_t t = 0; t < R; ++t) {
+        for (uint32_t r = 0; r <= t; ++r) {
+          const uint32_t c = t - r;
+          const size_t row = static_cast<size_t>(y + r) * w;
+          const uint16_t * up = vals + row - w;
+          left[r] = (c == 0) ?
+            unstep(row, up[0]) :
+            unstep(row + c, med_predict(left[r], up[c], up[c - 1]));
+        }
+      }
+      // Steady state: all R chains active, no bounds checks.
+      for (uint32_t t = R; t < w; ++t) {
+        for (uint32_t r = 0; r < R; ++r) {
+          const uint32_t c = t - r;
+          const size_t row = static_cast<size_t>(y + r) * w;
+          const uint16_t * up = vals + row - w;
+          left[r] = unstep(row + c, med_predict(left[r], up[c], up[c - 1]));
+        }
+      }
+      // Drain: finish the trailing columns of the lower rows.
+      for (uint32_t t = w; t < w + R - 1; ++t) {
+        for (uint32_t r = t - w + 1; r < R; ++r) {
+          const uint32_t c = t - r;
+          const size_t row = static_cast<size_t>(y + r) * w;
+          const uint16_t * up = vals + row - w;
+          left[r] = unstep(row + c, med_predict(left[r], up[c], up[c - 1]));
+        }
+      }
+    }
+  }
+  // Remaining rows (strip remainder, or narrow images): serial scan.
+  for (; y < h; ++y) {
     const size_t row = static_cast<size_t>(y) * w;
     int32_t left = unstep(row, vals[row - w]);
     const uint16_t * up = vals + row - w;
